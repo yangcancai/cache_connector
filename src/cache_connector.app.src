@@ -1,0 +1,11 @@
+{application,
+ cache_connector,
+ [{description, "An OTP application"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {cache_connector_app, []}},
+  {applications, [kernel, stdlib, cool_tools]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Apache 2.0"]},
+  {links, []}]}.
