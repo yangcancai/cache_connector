@@ -56,6 +56,9 @@
   fetch_batch/1,
   tag_deleted_batch/2]).
 
+%% [undefined, <<"LOCKED">>]
+%% [<<Value>>, undefined]
+-type lua_get_res()  :: [undefined | binary()].
 fetch(#{type := strong,cmd_fn := CmdFn, key := Key, ttl := TTL, fn := Fn}) ->
   strong_fetch(CmdFn, Key, TTL, Fn);
 %% disable cache read
@@ -106,9 +109,14 @@ raw_set(CmdFn, Key, Value, TTL) ->
          CmdFn([expire, Key, to_seconds(TTL)]);
        E -> E
   end.
-
-lua_get(CmdFn,Key, Owner) ->
-  Script = " -- luaGet
+-spec lua_get(CmdFn :: fun((Elem :: L) -> Return),
+    Key :: binary(),
+    Owner :: binary()) -> Res when
+    Return :: {ok, lua_get_res()} | {error, term()},
+    Res :: {ok, lua_get_res()}  | {error, term()},
+    L :: list().
+lua_get(CmdFn, Key, Owner) ->
+  Script = <<" -- luaGet
 	local v = redis.call('HGET', KEYS[1], 'value')
 	local lu = redis.call('HGET', KEYS[1], 'lockUntil')
 	if lu ~= false and tonumber(lu) < tonumber(ARGV[1]) or lu == false and v == false then
@@ -116,11 +124,12 @@ lua_get(CmdFn,Key, Owner) ->
 		redis.call('HSET', KEYS[1], 'lockOwner', ARGV[3])
 		return { v, 'LOCKED' }
 	end
-	return {v, lu}",
-  CmdFn([eval, Script, [Key], [erlang:system_time(1) + to_seconds(?LOCKED_EXPIRE), Owner]]).
+	return {v, lu}">>,
+  Now = erlang:system_time(1000),
+  CmdFn([eval, Script, 1, Key, Now, erlang:integer_to_binary(Now + to_seconds(?LOCKED_EXPIRE)), Owner]).
 
 lua_get_batch(CmdFn, Keys, Owner) ->
-  Script = "-- luaGetBatch
+  Script = <<"-- luaGetBatch
     local rets = {}
     for i, key in ipairs(KEYS)
     do
@@ -134,11 +143,19 @@ lua_get_batch(CmdFn, Keys, Owner) ->
             table.insert(rets, {v, lu})
         end
     end
-    return rets",
-  CmdFn([eval, Script, Keys, [erlang:system_time(1), erlang:system_time(1) + to_seconds(?LOCKED_EXPIRE), Owner]]).
+    return rets">>,
+  CmdFn([eval, Script, erlang:length(Keys), Keys] ++ [erlang:system_time(1), erlang:system_time(1) + to_seconds(?LOCKED_EXPIRE), Owner]).
 
+-spec lua_set(fun((L:: T) -> Return),
+    binary(),
+    binary(),
+    pos_integer(),
+    binary()) -> Res when
+    T :: list(),
+    Return :: {ok, term()} | {error, term()},
+    Res :: ok | {error, term()}.
 lua_set(CmdFn, Key, Value, TTL, Owner) ->
-  Script = "-- luaSet
+  Script = <<"-- luaSet
 	local o = redis.call('HGET', KEYS[1], 'lockOwner')
 	if o ~= ARGV[2] then
 			return
@@ -147,11 +164,14 @@ lua_set(CmdFn, Key, Value, TTL, Owner) ->
 	redis.call('HDEL', KEYS[1], 'lockUntil')
 	redis.call('HDEL', KEYS[1], 'lockOwner')
 	redis.call('EXPIRE', KEYS[1], ARGV[3])
-  ",
-  CmdFn([eval, Script, [Key], [Value, Owner, to_seconds(TTL)]]).
+  ">>,
+  case CmdFn([eval, Script, 1, Key, Value, Owner, erlang:integer_to_binary(to_seconds(TTL))]) of
+    {ok, _}  -> ok;
+    E -> E
+  end.
 
 lua_set_batch(CmdFn, Keys, Values, TTLS, Owner) ->
-  Script = "-- luaSetBatch
+  Script = <<"-- luaSetBatch
     local n = #KEYS
     for i, key in ipairs(KEYS)
     do
@@ -163,12 +183,12 @@ lua_set_batch(CmdFn, Keys, Values, TTLS, Owner) ->
         redis.call('HDEL', key, 'lockUntil')
         redis.call('HDEL', key, 'lockOwner')
         redis.call('EXPIRE', key, ARGV[i+1+n])
-    end",
-  CmdFn([eval, Script, Keys, [Owner| Values] ++ TTLS]).
+    end">>,
+  CmdFn([eval, Script, erlang:length(Keys), Keys, Owner] ++  Values ++ TTLS).
 
 lock_for_update(CmdFn, Key, Owner) ->
   LockUntil = math:pow(10,10),
-  Script = "-- luaLock
+  Script = <<"-- luaLock
 	local lu = redis.call('HGET', KEYS[1], 'lockUntil')
 	local lo = redis.call('HGET', KEYS[1], 'lockOwner')
 	if lu == false or tonumber(lu) < tonumber(ARGV[2]) or lo == ARGV[1] then
@@ -176,33 +196,36 @@ lock_for_update(CmdFn, Key, Owner) ->
 		redis.call('HSET', KEYS[1], 'lockOwner', ARGV[1])
 		return 'LOCKED'
 	end
-	return lo",
-  CmdFn([eval, Script, [Key], [Owner, LockUntil]]).
+	return lo">>,
+  CmdFn([eval, Script, 1, Key, Owner, LockUntil]).
 unlock_for_update(CmdFn, Key, Owner) ->
-  Script = " -- luaUnlock
+  Script = <<" -- luaUnlock
 	local lo = redis.call('HGET', KEYS[1], 'lockOwner')
 	if lo == ARGV[1] then
 		redis.call('HSET', KEYS[1], 'lockUntil', 0)
 		redis.call('HDEL', KEYS[1], 'lockOwner')
 		redis.call('EXPIRE', KEYS[1], ARGV[2])
 	end
-",
-  CmdFn([eval, Script, [Key], [Owner, to_seconds(?LOCKED_EXPIRE)]]).
+">>,
+  CmdFn([eval, Script, 1, Key, Owner, to_seconds(?LOCKED_EXPIRE)]).
 
 lua_delete(CmdFn, Key) ->
-  Script = " --  delete
+  Script = <<" --  delete
 		redis.call('HSET', KEYS[1], 'lockUntil', 0)
 		redis.call('HDEL', KEYS[1], 'lockOwner')
-		redis.call('EXPIRE', KEYS[1], ARGV[1])",
-  CmdFn([eval, Script, [Key], [to_seconds(?DELAY_DELETE)]]).
+		redis.call('EXPIRE', KEYS[1], ARGV[1])">>,
+  case CmdFn([eval, Script, 1, Key, to_seconds(?DELAY_DELETE)]) of
+    {ok, _}  -> ok;
+    E -> E
+  end.
 
 lua_delete_batch(CmdFn, Keys) ->
-  Script = " -- luaDeleteBatch
+  Script = <<" -- luaDeleteBatch
 		for i, key in ipairs(KEYS) do
 			redis.call('HSET', key, 'lockUntil', 0)
 			redis.call('HDEL', key, 'lockOwner')
 			redis.call('EXPIRE', key, ARGV[1])
-		end",
+		end">>,
   CmdFn([eval, Script, Keys, [to_seconds(?DELAY_DELETE)]]).
 
 strong_fetch(CmdFn, Key, TTL, FetchDbFn) ->
