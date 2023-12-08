@@ -42,6 +42,7 @@
 %% if the expire time is set to 600s, and this value is set to 0.1, then the actual expire time will be 540s - 600s
 %% solve the problem of cache avalanche.
 -define(RandomExpireAdjustment, 0.1).
+-include_lib("kernel/include/logger.hrl").
 -author("Cam").
 
 -export([
@@ -99,7 +100,6 @@ tag_deleted_batch(CmdFn, Keys) ->
       lua_delete_batch(CmdFn, Keys)
   end.
 
-
 raw_get(CmdFn, Key) ->
   CmdFn([hget, Key, value]).
 
@@ -144,7 +144,7 @@ lua_get_batch(CmdFn, Keys, Owner) ->
         end
     end
     return rets">>,
-  CmdFn([eval, Script, erlang:length(Keys), Keys] ++ [erlang:system_time(1), erlang:system_time(1) + to_seconds(?LOCKED_EXPIRE), Owner]).
+  CmdFn([eval, Script, erlang:length(Keys) | Keys]  ++ [erlang:system_time(1), erlang:system_time(1) + to_seconds(?LOCKED_EXPIRE), Owner]).
 
 -spec lua_set(fun((L:: T) -> Return),
     binary(),
@@ -185,7 +185,12 @@ lua_set_batch(CmdFn, Keys, Values, TTLS, Owner) ->
         redis.call('EXPIRE', key, ARGV[i+1+n])
     end">>,
   CmdFn([eval, Script, erlang:length(Keys), Keys, Owner] ++  Values ++ TTLS).
-
+-spec lock_for_update(fun((L) -> (Res)),Key, Owner) ->
+  {ok, binary()} | {error, term()} when
+  L :: list(),
+  Key :: binary(),
+  Owner :: binary(),
+  Res :: {ok, binary()} | {error, term()}.
 lock_for_update(CmdFn, Key, Owner) ->
   LockUntil = math:pow(10,10),
   Script = <<"-- luaLock
@@ -197,7 +202,13 @@ lock_for_update(CmdFn, Key, Owner) ->
 		return 'LOCKED'
 	end
 	return lo">>,
-  CmdFn([eval, Script, 1, Key, Owner, LockUntil]).
+  CmdFn([eval, Script, 1, Key, Owner, erlang:trunc(LockUntil)]).
+
+-spec unlock_for_update(CmdFn :: fun((L) -> (Res)),
+  Key :: binary(),
+  Owner :: binary()) -> ok | {error, term()} when
+  L :: list(),
+  Res :: {ok, undefined} | {error, term()}.
 unlock_for_update(CmdFn, Key, Owner) ->
   Script = <<" -- luaUnlock
 	local lo = redis.call('HGET', KEYS[1], 'lockOwner')
@@ -207,8 +218,16 @@ unlock_for_update(CmdFn, Key, Owner) ->
 		redis.call('EXPIRE', KEYS[1], ARGV[2])
 	end
 ">>,
-  CmdFn([eval, Script, 1, Key, Owner, to_seconds(?LOCKED_EXPIRE)]).
+  case CmdFn([eval, Script, 1, Key, Owner, to_seconds(?LOCKED_EXPIRE)]) of
+    {ok, _}  -> ok;
+    E -> E
+  end.
 
+-spec lua_delete(fun((L) -> (Res)),
+    Key) -> ok | {error, term()} when
+  L :: list(),
+  Key :: binary(),
+  Res :: {ok, term()} | {error, term()}.
 lua_delete(CmdFn, Key) ->
   Script = <<" --  delete
 		redis.call('HSET', KEYS[1], 'lockUntil', 0)
@@ -260,7 +279,7 @@ strong_fetch_batch(CmdFn, Keys, TTL, FetchDbFn) ->
        E
   end.
 do_result(Fetched, I, Result) ->
-  Result#{I => maps:get(I, Fetched)}.
+  Result#{I => proplists:get_value(I, Fetched)}.
 
 do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) ->
   List = cool_tools:pmap(cool_tools_pa:bind(fun do_to_get1/4, CmdFn, Keys, Owner), ToGet),
@@ -307,41 +326,42 @@ wait_to_lua_get(CmdFn, Key, Owner) ->
   end.
 
 do_to_fetch(_CmdFn, _Keys, [], _TTL, _Owner, _FetchDbFn) ->
-  {ok, #{}};
+  {ok, []};
 do_to_fetch(CmdFn, Keys, ToFetch, TTL, Owner, FetchDbFn) ->
   case FetchDbFn(ToFetch) of
     {ok, Data}  ->
       {BatchKeys, BatchValues, BatchExpires} = lists:foldl(
-        cool_tools_pa:bind(fun do_to_fetch1/6, CmdFn, Data, Keys, TTL),
+        cool_tools_pa:bind(fun do_to_fetch1/6, CmdFn, erlang:list_to_tuple(Data), erlang:list_to_tuple(Keys), TTL),
         {[], [], []}, ToFetch),
       lua_set_batch(CmdFn, BatchKeys, BatchValues, BatchExpires, Owner),
       {ok, Data};
     E ->
+      Keys1 = erlang:list_to_tuple(Keys),
       lists:foldl(fun(I, Acc) ->
-        unlock_for_update(CmdFn, maps:get(I, Keys), Owner),
+        unlock_for_update(CmdFn, erlang:element(I, Keys1), Owner),
         Acc end, ok, ToFetch),
       E
   end.
 do_to_fetch1(CmdFn, Data, Keys, TTL, I, {BatchKeys, BatchValues, BatchExpires})  ->
   Ex = to_seconds(TTL - ?DELAY_DELETE - erlang:trunc(rand:uniform() * ?RandomExpireAdjustment * TTL)),
-  case maps:get(I, Data, <<>>) of
+  case erlang:element(I, Data) of
     <<>> ->
       case ?EMPTY_EXPIRE of
           0 ->
             CmdFn([del, maps:get(I, Keys)]),
             {BatchKeys, BatchValues, BatchExpires};
           _->
-            {[maps:get(I, Keys) | BatchKeys], [ <<>> | BatchValues], [ to_seconds(?EMPTY_EXPIRE) | BatchExpires]}
+            {[erlang:element(I, Keys) | BatchKeys], [ <<>> | BatchValues], [ to_seconds(?EMPTY_EXPIRE) | BatchExpires]}
       end;
     V ->
-      {[maps:get(I, Keys) | BatchKeys], [ V | BatchValues], [ Ex | BatchExpires]}
+      {[element(I, Keys) | BatchKeys], [ V | BatchValues], [ Ex | BatchExpires]}
   end.
-do_fetch_batch({A, nil}, {ToGet, ToFetch, Result, I}) ->
+do_fetch_batch([A, undefined], {ToGet, ToFetch, Result, I}) ->
   {ToGet, ToFetch, Result#{I => A}, I + 1};
-do_fetch_batch({_A, <<"LOCKED">>}, {ToGet, ToFetch, Result, I}) ->
+do_fetch_batch([_A, <<"LOCKED">>], {ToGet, ToFetch, Result, I}) ->
   {ToGet, [ I | ToFetch],  Result, I + 1};
 %% locked by other
-do_fetch_batch({_A, _}, {ToGet, ToFetch, Result, I}) ->
+do_fetch_batch([_A, _], {ToGet, ToFetch, Result, I}) ->
   {[I | ToGet], ToFetch,Result, I + 1}.
 
 weak_fetch(CmdFn, Key, TTL, FetchDbFn) ->
@@ -363,17 +383,19 @@ weak_fetch_batch(CmdFn, Keys, TTL, FetchDbFn) ->
   Owner = cool_tools:to_binary(cool_tools:uuid_v1_string()),
   case lua_get_batch(CmdFn, Keys, Owner) of
     {ok, Res}  ->
-      {Result, ToFetchAsync, ToFetch, ToGet, _} = lists:foldl(fun do_weak_fetch_batch/2, {#{}, [], [], [], 1}, Res),
-      to_fetch_async(CmdFn, Keys, ToFetchAsync, TTL, Owner, FetchDbFn),
+      {Result, ToFetchAsync, ToFetch1, ToGet, _} = lists:foldl(fun do_weak_fetch_batch/2, {#{}, [], [], [], 1}, Res),
+      to_fetch_async(CmdFn, Keys, lists:reverse(ToFetchAsync), TTL, Owner, FetchDbFn),
+      ToFetch = lists:reverse(ToFetch1),
       case do_to_fetch(CmdFn, Keys, ToFetch, TTL, Owner, FetchDbFn) of
         {ok, Fetched} ->
-           Result1 = lists:foldl(cool_tools_pa:bind(fun do_result/3, Fetched), Result, ToFetch),
-           do_weak_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result1, FetchDbFn);
-        FetchErr ->
-          FetchErr
+           L = lists:zip(ToFetch, Fetched),
+           Result1 = lists:foldl(cool_tools_pa:bind(fun do_result/3, L), Result, ToFetch),
+           do_weak_to_get(CmdFn, Keys, lists:reverse(ToGet), TTL, Owner, Result1, FetchDbFn);
+        {error, FetchErr} ->
+          {error, FetchErr}
       end;
-    E ->
-      E
+    {error, E} ->
+      {error, E}
   end.
 
 to_fetch_async(CmdFn, Keys, ToFetchAsync, TTL, Owner, FetchDbFn) ->
@@ -381,13 +403,13 @@ to_fetch_async(CmdFn, Keys, ToFetchAsync, TTL, Owner, FetchDbFn) ->
      do_to_fetch(CmdFn, Keys, ToFetchAsync, TTL, Owner, FetchDbFn)
   end).
 
-do_weak_fetch_batch({nil, <<"LOCKED">>}, {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
+do_weak_fetch_batch([undefined, <<"LOCKED">>], {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
   {Result, ToFetchAsync, [I | ToFetch], ToGet, I + 1};
-do_weak_fetch_batch({nil, _B}, {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
+do_weak_fetch_batch([undefined, _B], {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
   {Result, ToFetchAsync, ToFetch, [I | ToGet], I + 1};
-do_weak_fetch_batch({A, <<"LOCKED">>}, {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
+do_weak_fetch_batch([A, <<"LOCKED">>], {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
   {Result#{I => A}, [ I | ToFetchAsync], ToFetch, ToGet, I + 1};
-do_weak_fetch_batch({A, _}, {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
+do_weak_fetch_batch([A, _], {Result, ToFetchAsync, ToFetch, ToGet, I}) ->
   {Result#{I => A}, ToFetchAsync, ToFetch, ToGet, I + 1}.
 
 fetch_new(CmdFn, Key, TTL, Owner, FetchDbFn) ->
@@ -422,9 +444,10 @@ do_weak_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) ->
        ok ->
          to_fetch_async(CmdFn, Keys, NeedFetchAsync, TTL, Owner, FetchDbFn),
          case do_to_fetch(CmdFn, Keys, NeedFetch, TTL, Owner, FetchDbFn) of
-           {ok, Fetched}  ->
-             {ok, lists:foldl(cool_tools_pa:bind(fun do_result/3, Fetched), NewResult, NeedFetch)};
-           E -> E
+           {ok, NeedFetchDataList}  ->
+              L  = lists:zip(NeedFetch, NeedFetchDataList),
+             {ok, maps:values(lists:foldl(cool_tools_pa:bind(fun do_result/3, L), NewResult, NeedFetch))};
+           {error, E} -> {error, E}
          end
   end.
 to_weak_get_res({ok, I, need_fetch}, {Result, NeedFetch, NeedFetchAsync, Ok}) ->

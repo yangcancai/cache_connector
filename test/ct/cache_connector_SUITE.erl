@@ -32,7 +32,7 @@
 -define(KEY, <<"cache-connector-test-key">>).
 
 all() ->
-    [lua_get, lua_delete, weak_fetch, weak_fetch_error, strongfetch, strongfetch_error, fetch_batch].
+    [lock, lua_get, lua_delete, weak_fetch, weak_fetch_error, strongfetch, strongfetch_error].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(cache_connector),
@@ -62,6 +62,16 @@ del_meck() ->
 
 handle(_Config) ->
     ok.
+lock(_) ->
+  CmdFn = cmd_fn(),
+  Key = <<"cache-connector-lock">>,
+  Owner = <<"test_owner">>,
+  delete(CmdFn, Key),
+  {ok, <<"LOCKED">>} = cache_connector:lock_for_update(CmdFn, Key, Owner),
+  %% lock by test_owner
+  {ok, <<"test_owner">>} = cache_connector:lock_for_update(CmdFn, Key, <<"other">>),
+  ok = cache_connector:unlock_for_update(CmdFn, Key, <<"other">>),
+  ok.
 lua_get(_) ->
   CmdFn = cmd_fn(),
   delete(CmdFn, ?KEY),
@@ -186,8 +196,6 @@ strongfetch_error(_) ->
        fn => fun() -> {ok, <<"v1">>} end}),
     ?assertEqual(time_since(Begin) < 150, true),
   ok.
-fetch_batch(_) ->
-    ok.
 
 start_redis() ->
     {ok, _} = application:ensure_all_started(eredis),
