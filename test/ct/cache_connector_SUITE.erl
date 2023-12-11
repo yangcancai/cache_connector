@@ -32,10 +32,15 @@
 -define(KEY, <<"cache-connector-test-key">>).
 
 all() ->
-    [lock, lua_get, lua_delete, weak_fetch, weak_fetch_error, strongfetch, strongfetch_error].
+    [
+      lock, lua_get, lua_delete,
+      weak_fetch,
+      weak_fetch_error, strongfetch, strongfetch_error].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(cache_connector),
+    cool_tools_logger:set_global_loglevel(debug),
+    cool_tools_logger:start_default_log(true),
     start_redis(),
     new_meck(),
     Config.
@@ -87,7 +92,7 @@ lua_delete(_) ->
   ok = cache_connector:lua_delete(CmdFn, ?KEY),
   ok.
 weak_fetch(_) ->
-   Key = <<"weak_fetch">>,
+   Key = <<"weak_fetch1">>,
    V1 = <<"v1">>,
    V2 = <<"v2">>,
    CmdFn = cmd_fn(),
@@ -109,7 +114,7 @@ weak_fetch(_) ->
          fn => gen_data_func(V1, 201)}),
      ?assertEqual(time_since(Begin) > 150, true),
      ok = cache_connector:tag_deleted(CmdFn, Key),
-   {ok, V2} = cache_connector:fetch(#{type => weak,
+   {ok, V1} = cache_connector:fetch(#{type => weak,
          cmd_fn => CmdFn1,
          key => Key,
          ttl => 60000,

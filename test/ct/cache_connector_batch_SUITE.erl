@@ -16,7 +16,7 @@
 
 all() ->
     [
-%%      lua_get_batch,weak_fetch_batch,
+      lua_get_batch,weak_fetch_batch,
       weak_fetch_batch_overlap, strong_fetch_batch].
 
 init_per_suite(Config) ->

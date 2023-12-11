@@ -126,7 +126,9 @@ lua_get(CmdFn, Key, Owner) ->
 	end
 	return {v, lu}">>,
   Now = erlang:system_time(1),
-  CmdFn([eval, Script, 1, Key, Now, erlang:integer_to_binary(Now + to_seconds(?LOCKED_EXPIRE)), Owner]).
+  Res = CmdFn([eval, Script, 1, Key, Now, erlang:integer_to_binary(Now + to_seconds(?LOCKED_EXPIRE)), Owner]),
+  ?LOG_DEBUG("lua_get => owner = ~p, res = ~p, key = ~p",[Owner, Res, Key]),
+  Res.
 
 lua_get_batch(CmdFn, Keys, Owner) ->
   Script = <<"-- luaGetBatch
@@ -166,7 +168,9 @@ lua_set(CmdFn, Key, Value, TTL, Owner) ->
 	redis.call('EXPIRE', KEYS[1], ARGV[3])
   ">>,
   case CmdFn([eval, Script, 1, Key, Value, Owner, erlang:integer_to_binary(to_seconds(TTL))]) of
-    {ok, _}  -> ok;
+    {ok, _}  ->
+      ?LOG_DEBUG("lua_set =>  owner = ~p, key = ~p, value = ~p",[Owner, Key, Value]),
+      ok;
     E -> E
   end.
 
@@ -237,7 +241,9 @@ lua_delete(CmdFn, Key) ->
 		redis.call('HDEL', KEYS[1], 'lockOwner')
 		redis.call('EXPIRE', KEYS[1], ARGV[1])">>,
   case CmdFn([eval, Script, 1, Key, to_seconds(?DELAY_DELETE)]) of
-    {ok, _}  -> ok;
+    {ok, _}  ->
+      ?LOG_DEBUG("lua_delete => key = ~p",[Key]),
+      ok;
     E -> E
   end.
 
@@ -275,20 +281,22 @@ strong_fetch_batch(CmdFn, Keys, TTL, FetchDbFn) ->
   case lua_get_batch(CmdFn, Keys, Owner) of
     {ok, Res}  ->
       {ToGet, ToFetch, Result, _} = lists:foldl(fun do_fetch_batch/2,{[], [], #{}, 1} ,Res),
-      case do_to_fetch(CmdFn, Keys, ToFetch, TTL, Owner, FetchDbFn) of
+      KeysTuple = erlang:list_to_tuple(Keys),
+      case do_to_fetch(CmdFn, KeysTuple, ToFetch, TTL, Owner, FetchDbFn) of
         {ok, Fetched} ->
-           Result1 = lists:foldl(cool_tools_pa:bind(fun do_result/3, Fetched), Result, ToFetch),
+           L = lists:zip(ToFetch, Fetched),
+           Result1 = lists:foldl(fun do_result/2, Result, L),
            do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result1, FetchDbFn);
-        FetchErr ->
-          FetchErr
+        {error, FetchE}->
+          {error,FetchE}
       end;
-    E ->
-       E
+    {error, E} ->
+      {error, E}
   end.
-do_result(Fetched, I, Result) ->
-  Result#{I => proplists:get_value(I, Fetched)}.
+do_result({I, V}, Result) ->
+  Result#{I => V}.
 
-do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) ->
+do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) when is_tuple(Keys)->
   List = cool_tools:pmap(cool_tools_pa:bind(fun do_to_get1/4, CmdFn, Keys, Owner), ToGet),
   {NewResult, NeedFetch, Err} = lists:foldl(fun to_get_res/2, {Result, [], ok}, List),
   case Err of
@@ -297,7 +305,8 @@ do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) ->
        ok ->
          case do_to_fetch(CmdFn, Keys, NeedFetch, TTL, Owner, FetchDbFn) of
            {ok, Fetched}  ->
-             {ok, lists:foldl(cool_tools_pa:bind(fun do_result/3, Fetched), NewResult, NeedFetch)};
+             L = lists:zip(NeedFetch, Fetched),
+             {ok, do_all_res(lists:foldl(fun do_result/2, NewResult, L), erlang:tuple_size(Keys), 1, [])};
            E -> E
          end
   end.
@@ -309,8 +318,8 @@ to_get_res({ok, I, need_fetch}, {Result, NeedFetch, Ok}) ->
 to_get_res(_, {Result, NeedFetch, _Ok}) ->
   {Result, NeedFetch, error}.
 
-do_to_get1(CmdFn, Keys, Owner, I) ->
-  case wait_to_lua_get(CmdFn, maps:get(I, Keys), Owner) of
+do_to_get1(CmdFn, Keys, Owner, I) when is_tuple(Keys)->
+  case wait_to_lua_get(CmdFn, element(I, Keys), Owner) of
     %% normal value
     {ok, [A, B]} when B /= <<"LOCKED">> ->
       {ok, I, A};
@@ -375,13 +384,17 @@ weak_fetch(CmdFn, Key, TTL, FetchDbFn) ->
   weak_fetch(CmdFn, Key, TTL, FetchDbFn, cool_tools:to_binary(cool_tools:uuid_v1_string())).
 weak_fetch(CmdFn, Key, TTL, FetchDbFn, Owner) ->
   case lua_get(CmdFn, Key, Owner) of
-    {ok, [A, B| _]}  when A == undefined , B /= <<"LOCKED">> ->
+    {ok, [A, B]}  when A == undefined , B /= <<"LOCKED">> ->
       timer:sleep(?LOCKED_SLEEP),
       weak_fetch(CmdFn, Key, TTL, FetchDbFn);
-    {ok, [A, B | _]} when B /= <<"LOCKED">> ->
+    {ok, [A, B]} when B /= <<"LOCKED">> ->
       {ok, A};
-    {ok, [A, _B | _]} when A /= undefined ->
+    {ok, [A, _B]} when A == undefined ->
       fetch_new(CmdFn, Key, TTL, Owner, FetchDbFn);
+    {ok, [A, _]} ->
+      erlang:spawn(fun() ->
+        fetch_new(CmdFn, Key, TTL, Owner, FetchDbFn) end),
+      {ok, A};
     E ->
       E
   end.
@@ -398,7 +411,7 @@ weak_fetch_batch(CmdFn, Keys, TTL, FetchDbFn) ->
       case do_to_fetch(CmdFn, KeysTuple, ToFetch, TTL, Owner, FetchDbFn) of
         {ok, Fetched} ->
            L = lists:zip(ToFetch, Fetched),
-           Result1 = lists:foldl(cool_tools_pa:bind(fun do_result/3, L), Result, ToFetch),
+           Result1 = lists:foldl(fun do_result/2, Result, L),
            ?LOG_DEBUG("owner = ~p, result = ~p, result1 = ~p, fetched = ~p, tofetch = ~p, toget = ~p, ToFetchAsync = ~p", [Owner, Result, Result1, Fetched, ToFetch, ToGet, ToFetchAsync]),
            do_weak_to_get(CmdFn, KeysTuple, lists:reverse(ToGet), TTL, Owner, Result1, FetchDbFn);
         {error, FetchErr} ->
@@ -434,8 +447,13 @@ fetch_new(CmdFn, Key, TTL, Owner, FetchDbFn) ->
               {ok, ""}
       end;
     {ok, Result} ->
-      lua_set(CmdFn, Key, Result, TTL, Owner),
-      {ok, Result};
+      ?LOG_DEBUG("fetch_new=> owner = ~p, result = ~p, key = ~p",[Owner, Result, Key]),
+      case lua_set(CmdFn, Key, Result, TTL, Owner) of
+         ok ->
+           {ok, Result};
+        {error, E}  ->
+           {error, E}
+      end;
     Error ->
         %% unlockForUpdate
       unlock_for_update(CmdFn, Key, Owner),
@@ -457,7 +475,7 @@ do_weak_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) when is_tuple(
          case do_to_fetch(CmdFn, Keys, NeedFetch, TTL, Owner, FetchDbFn) of
            {ok, NeedFetchDataList}  ->
               L  = lists:zip(NeedFetch, NeedFetchDataList),
-              Res = lists:foldl(cool_tools_pa:bind(fun do_result/3, L), NewResult, NeedFetch),
+              Res = lists:foldl(fun do_result/2, NewResult, L),
              {ok, do_all_res(Res, erlang:tuple_size(Keys), 1, [])};
            {error, E} -> {error, E}
          end
