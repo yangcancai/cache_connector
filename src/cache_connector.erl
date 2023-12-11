@@ -337,9 +337,10 @@ do_to_fetch(_CmdFn, _Keys, [], _TTL, _Owner, _FetchDbFn) ->
 do_to_fetch(CmdFn, Keys, ToFetch, TTL, Owner, FetchDbFn) when is_tuple(Keys)->
   case FetchDbFn(ToFetch) of
     {ok, Data}  ->
+      L = lists:zip(ToFetch, Data),
       {BatchKeys, BatchValues, BatchExpires} = lists:foldl(
-        cool_tools_pa:bind(fun do_to_fetch1/6, CmdFn, erlang:list_to_tuple(Data), Keys, TTL),
-        {[], [], []}, ToFetch),
+        cool_tools_pa:bind(fun do_to_fetch1/5, CmdFn, Keys, TTL),
+        {[], [], []}, L),
       lua_set_batch(CmdFn, BatchKeys, BatchValues, BatchExpires, Owner),
       {ok, Data};
     E ->
@@ -348,9 +349,9 @@ do_to_fetch(CmdFn, Keys, ToFetch, TTL, Owner, FetchDbFn) when is_tuple(Keys)->
         Acc end, ok, ToFetch),
       E
   end.
-do_to_fetch1(CmdFn, Data, Keys, TTL, I, {BatchKeys, BatchValues, BatchExpires})  when is_tuple(Keys)->
+do_to_fetch1(CmdFn, Keys, TTL, {I, Value}, {BatchKeys, BatchValues, BatchExpires})  when is_tuple(Keys)->
   Ex = to_seconds(TTL - ?DELAY_DELETE - erlang:trunc(rand:uniform() * ?RandomExpireAdjustment * TTL)),
-  case erlang:element(I, Data) of
+  case Value of
     <<>> ->
       case ?EMPTY_EXPIRE of
           0 ->
@@ -456,10 +457,15 @@ do_weak_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) when is_tuple(
          case do_to_fetch(CmdFn, Keys, NeedFetch, TTL, Owner, FetchDbFn) of
            {ok, NeedFetchDataList}  ->
               L  = lists:zip(NeedFetch, NeedFetchDataList),
-             {ok, maps:values(lists:foldl(cool_tools_pa:bind(fun do_result/3, L), NewResult, NeedFetch))};
+              Res = lists:foldl(cool_tools_pa:bind(fun do_result/3, L), NewResult, NeedFetch),
+             {ok, do_all_res(Res, erlang:tuple_size(Keys), 1, [])};
            {error, E} -> {error, E}
          end
   end.
+do_all_res(R, N, N, Acc) ->
+  lists:reverse([maps:get(N, R) | Acc]);
+do_all_res(R, N, C, Acc) ->
+  do_all_res(R, N, C + 1, [maps:get(C, R) | Acc]).
 to_weak_get_res({ok, I, need_fetch}, {Result, NeedFetch, NeedFetchAsync, Ok}) ->
   {Result, [I|NeedFetch], NeedFetchAsync, Ok};
 to_weak_get_res({ok, I, need_fetch_async}, {Result, NeedFetch, NeedFetchAsync, Ok}) ->
