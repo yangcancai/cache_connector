@@ -19,6 +19,8 @@ all() ->
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(cache_connector),
+    cool_tools_logger:set_global_loglevel(debug),
+  cool_tools_logger:start_default_log(true),
     start_redis(),
     new_meck(),
     Config.
@@ -61,18 +63,45 @@ lua_get_batch(_) ->
 weak_fetch_batch(_) ->
    CmdFn = cmd_fn(),
    N = 10 + rand:uniform(20),
-   {Keys, Values1, _Values2, _Values3} = get_batch_data(N),
+   Begin = erlang:system_time(1000),
+   {Keys, Values1, Values2, Values3} = get_batch_data(N),
    delete_batch(CmdFn, Keys),
-%%   erlang:spawn(fun() ->
+   erlang:spawn(fun() ->
      {ok, Values1} = cache_connector:fetch_batch(#{
                  type => weak,
                  cmd_fn => CmdFn,
                  keys => Keys,
                  ttl => 60000,
                  fn =>  gen_batch_data_func(N, Values1, 200)
+               })
+                end),
+   timer:sleep(20),
+   {ok, Values1} = cache_connector:fetch_batch(#{
+                 type => weak,
+                 cmd_fn => CmdFn,
+                 keys => Keys,
+                 ttl => 60000,
+                 fn =>  gen_batch_data_func(N, Values2, 200)
                }),
-%%                end),
-   timer:sleep(1000),
+   ?assertEqual(time_since(Begin) > 150, true),
+   ok = cache_connector:tag_deleted_batch(CmdFn, Keys),
+   Begin1 = erlang:system_time(1000),
+   {ok, Values1} = cache_connector:fetch_batch(#{
+                 type => weak,
+                 cmd_fn => CmdFn,
+                 keys => Keys,
+                 ttl => 60000,
+                 fn =>  gen_batch_data_func(N, Values3, 200)
+               }),
+  ?assertEqual(time_since(Begin1) < 200, true),
+  timer:sleep(300),
+  {ok, Values3} = cache_connector:fetch_batch(#{
+                 type => weak,
+                 cmd_fn => CmdFn,
+                 keys => Keys,
+                 ttl => 60000,
+                 fn =>  gen_batch_data_func(N, Values3, 200)
+               }),
    ok.
 strong_fetch_batch(_) ->
     ok.
