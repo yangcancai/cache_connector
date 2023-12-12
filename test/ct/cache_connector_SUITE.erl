@@ -33,6 +33,7 @@
 
 all() ->
     [
+      config,
       lock, lua_get, lua_delete,
       weak_fetch,
       weak_fetch_error, strongfetch, strongfetch_error].
@@ -67,6 +68,14 @@ del_meck() ->
 
 handle(_Config) ->
     ok.
+config(_) ->
+  ?assertEqual(cache_connector:default_config(), cache_connector:get_config()),
+  {error, _} = cache_connector:set_config(error_key, 1),
+  100 = cache_connector:get_config(locked_sleep),
+  ok = cache_connector:set_config(locked_sleep, 1),
+  1 = cache_connector:get_config(locked_sleep),
+  ok.
+
 lock(_) ->
   CmdFn = cmd_fn(),
   Key = <<"cache-connector-lock">>,

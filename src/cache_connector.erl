@@ -24,24 +24,24 @@
 
 -module(cache_connector).
 %% LockSleep is the sleep interval time if try lock failed. default is 100ms
--define(LOCKED_SLEEP, 100).
+-define(LOCKED_SLEEP, get_config(locked_sleep)).
 %% LockExpire is the expire time for the lock which is allocated when updating cache. default is 3s
 %% should be set to the max of the underling data calculating time.
--define(LOCKED_EXPIRE, 3000).
+-define(LOCKED_EXPIRE, get_config(locked_expire)).
 %%EmptyExpire is the expire time for empty result. default is 60s
--define(EMPTY_EXPIRE, application:get_env(cache_connector, empty_expire, 60000)).
+-define(EMPTY_EXPIRE, get_config(empty_expire)).
 %% Delay is the delay delete time for keys that are tag deleted. default is 10s
--define(DELAY_DELETE, 10000).
+-define(DELAY_DELETE, get_config(delay_delete)).
 %% WaitReplicas is the number of replicas to wait for. default is 0
 %% if WaitReplicas is > 0, it will use redis WAIT command to wait for TagAsDeleted synchronized.
--define(WAIT_REPLICAS, 0).
+-define(WAIT_REPLICAS, get_config(wait_replicas)).
 %% WaitReplicasTimeout is the number of replicas to wait for. default is 3000ms
 %% if WaitReplicas is > 0, WaitReplicasTimeout is the timeout for WAIT command.
--define(WAIT_REPLICAS_TIMEOUT, 3000).
+-define(WAIT_REPLICAS_TIMEOUT, get_config(wait_replicas_timeout)).
 %% RandomExpireAdjustment is the random adjustment for the expire time. default 0.1
 %% if the expire time is set to 600s, and this value is set to 0.1, then the actual expire time will be 540s - 600s
 %% solve the problem of cache avalanche.
--define(RandomExpireAdjustment, 0.1).
+-define(RandomExpireAdjustment, get_config(random_expire_adjustment)).
 -include_lib("kernel/include/logger.hrl").
 -author("Cam").
 
@@ -55,7 +55,45 @@
   lock_for_update/3,
   unlock_for_update/3,
   fetch_batch/1,
-  tag_deleted_batch/2]).
+  tag_deleted_batch/2,
+  set_config/2,
+  get_config/1,
+  default_config/0,
+  get_config/0,
+  init_default_config/0]).
+
+init_default_config() ->
+  [begin
+     case catch get_config(K) of
+       {'EXIT', _}  ->
+         ok = set_config(K, V),
+         {K, V};
+       V1 ->
+         {K, V1}
+     end
+   end|| {K, V} <- default_config()].
+default_config() ->
+  [{locked_sleep, 100},
+   {locked_expire, 3000},
+   {empty_expire, 60000},
+   {delay_delete, 10000},
+   {wait_replicas, 0},
+   {wait_replica_timeout, 3000},
+   {random_expire_adjustment, 0.1}].
+
+-spec set_config(Key :: atom(), Value :: integer() | float()) -> ok | {error, term()}.
+set_config(Key, Value) ->
+  case lists:keyfind(Key, 1, default_config()) of
+      false ->
+        L = [ K || {K, _} <- default_config()],
+        {error, { key_not_in, L}};
+      _->
+        persistent_term:put(Key, Value)
+  end.
+get_config(Key) ->
+  persistent_term:get(Key).
+get_config() ->
+  [ {K, get_config(K)} || {K, _} <- default_config()].
 
 %% [undefined, <<"LOCKED">>]
 %% [<<Value>>, undefined]
@@ -127,7 +165,7 @@ lua_get(CmdFn, Key, Owner) ->
 	return {v, lu}">>,
   Now = erlang:system_time(1),
   Res = CmdFn([eval, Script, 1, Key, Now, erlang:integer_to_binary(Now + to_seconds(?LOCKED_EXPIRE)), Owner]),
-  ?LOG_DEBUG("lua_get => owner = ~p, res = ~p, key = ~p",[Owner, Res, Key]),
+%%  ?LOG_DEBUG("lua_get => owner = ~p, res = ~p, key = ~p",[Owner, Res, Key]),
   Res.
 
 lua_get_batch(CmdFn, Keys, Owner) ->
@@ -264,11 +302,11 @@ strong_fetch(CmdFn, Key, TTL, FetchDbFn) ->
   strong_fetch(CmdFn, Key, TTL, FetchDbFn, cool_tools:to_binary(cool_tools:uuid_v1_string())).
 strong_fetch(CmdFn, Key, TTL, FetchDbFn, Owner) ->
   case lua_get(CmdFn, Key, Owner) of
-    {ok, [_,Row |_]}  when Row /= undefined, Row /= <<"LOCKED">> ->
+    {ok, [_,Row]}  when Row /= undefined, Row /= <<"LOCKED">> ->
       %% sleep
        timer:sleep(?LOCKED_SLEEP),
        strong_fetch(CmdFn, Key, TTL, FetchDbFn, Owner);
-    {ok, [V, Row |_]}  when Row /= <<"LOCKED">> ->
+    {ok, [V, Row]}  when Row /= <<"LOCKED">> ->
        {ok, V};
     {ok, _} ->
        %% fetch_new
@@ -285,8 +323,9 @@ strong_fetch_batch(CmdFn, Keys, TTL, FetchDbFn) ->
       case do_to_fetch(CmdFn, KeysTuple, ToFetch, TTL, Owner, FetchDbFn) of
         {ok, Fetched} ->
            L = lists:zip(ToFetch, Fetched),
+           ?LOG_DEBUG("strong_fetch_batch => Owner = ~p, res = ~p",[Owner, Res]),
            Result1 = lists:foldl(fun do_result/2, Result, L),
-           do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result1, FetchDbFn);
+           do_to_get(CmdFn, KeysTuple, ToGet, TTL, Owner, Result1, FetchDbFn);
         {error, FetchE}->
           {error,FetchE}
       end;
@@ -306,15 +345,15 @@ do_to_get(CmdFn, Keys, ToGet, TTL, Owner, Result, FetchDbFn) when is_tuple(Keys)
          case do_to_fetch(CmdFn, Keys, NeedFetch, TTL, Owner, FetchDbFn) of
            {ok, Fetched}  ->
              L = lists:zip(NeedFetch, Fetched),
+             ?LOG_DEBUG("do_to_get => owner = ~p, List = ~p, toget = ~p, newresult = ~p",[Owner, List, ToGet, NewResult]),
              {ok, do_all_res(lists:foldl(fun do_result/2, NewResult, L), erlang:tuple_size(Keys), 1, [])};
            E -> E
          end
   end.
-
-to_get_res({ok, I, V}, {Result, NeedFetch, Ok}) ->
-  {Result#{I => V}, NeedFetch, Ok};
 to_get_res({ok, I, need_fetch}, {Result, NeedFetch, Ok}) ->
   {Result, [I|NeedFetch], Ok};
+to_get_res({ok, I, V}, {Result, NeedFetch, Ok}) ->
+  {Result#{I => V}, NeedFetch, Ok};
 to_get_res(_, {Result, NeedFetch, _Ok}) ->
   {Result, NeedFetch, error}.
 
@@ -332,7 +371,7 @@ do_to_get1(CmdFn, Keys, Owner, I) when is_tuple(Keys)->
 
 wait_to_lua_get(CmdFn, Key, Owner) ->
   case lua_get(CmdFn, Key, Owner) of
-     {ok, [A, B]} when A /= undefined , B /= <<"LOCKED">> ->
+     {ok, [_A, B]} when B /= undefined , B /= <<"LOCKED">> ->
        timer:sleep(?LOCKED_SLEEP),
        wait_to_lua_get(CmdFn, Key, Owner);
     {ok, R} ->
@@ -374,11 +413,11 @@ do_to_fetch1(CmdFn, Keys, TTL, {I, Value}, {BatchKeys, BatchValues, BatchExpires
   end.
 do_fetch_batch([A, undefined], {ToGet, ToFetch, Result, I}) ->
   {ToGet, ToFetch, Result#{I => A}, I + 1};
-do_fetch_batch([_A, <<"LOCKED">>], {ToGet, ToFetch, Result, I}) ->
-  {ToGet, [ I | ToFetch],  Result, I + 1};
 %% locked by other
+do_fetch_batch([_A, B], {ToGet, ToFetch, Result, I}) when B /= <<"LOCKED">> ->
+  {[I | ToGet], ToFetch,Result, I + 1};
 do_fetch_batch([_A, _], {ToGet, ToFetch, Result, I}) ->
-  {[I | ToGet], ToFetch,Result, I + 1}.
+  {ToGet, [ I | ToFetch],  Result, I + 1}.
 
 weak_fetch(CmdFn, Key, TTL, FetchDbFn) ->
   weak_fetch(CmdFn, Key, TTL, FetchDbFn, cool_tools:to_binary(cool_tools:uuid_v1_string())).
@@ -440,7 +479,7 @@ fetch_new(CmdFn, Key, TTL, Owner, FetchDbFn) ->
     {ok, <<>>} ->
        case ?EMPTY_EXPIRE of
             0 ->
-              ok = CmdFn([del, Key]),
+              {ok, _} = CmdFn([del, Key]),
               {ok, ""};
            _->
               lua_set(CmdFn, Key, <<>>, ?EMPTY_EXPIRE, Owner),
