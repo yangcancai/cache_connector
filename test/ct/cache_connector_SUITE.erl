@@ -29,14 +29,18 @@
 -include("cache_connector_ct.hrl").
 
 -compile(export_all).
+
 -define(KEY, <<"cache-connector-test-key">>).
 
 all() ->
-    [
-      config,
-      lock, lua_get, lua_delete,
-      weak_fetch,
-      weak_fetch_error, strongfetch, strongfetch_error].
+    [config,
+     lock,
+     lua_get,
+     lua_delete,
+     weak_fetch,
+     weak_fetch_error,
+     strongfetch,
+     strongfetch_error].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(cache_connector),
@@ -68,170 +72,184 @@ del_meck() ->
 
 handle(_Config) ->
     ok.
+
 config(_) ->
-  ?assertEqual(cache_connector:default_config(), cache_connector:get_config()),
-  {error, _} = cache_connector:set_config(error_key, 1),
-  100 = cache_connector:get_config(locked_sleep),
-  ok = cache_connector:set_config(locked_sleep, 1),
-  1 = cache_connector:get_config(locked_sleep),
-  ok.
+    ?assertEqual(cache_connector:default_config(), cache_connector:get_config()),
+    {error, _} = cache_connector:set_config(error_key, 1),
+    100 = cache_connector:get_config(locked_sleep),
+    ok = cache_connector:set_config(locked_sleep, 1),
+    1 = cache_connector:get_config(locked_sleep),
+    ok.
 
 lock(_) ->
-  CmdFn = cmd_fn(),
-  Key = <<"cache-connector-lock">>,
-  Owner = <<"test_owner">>,
-  delete(CmdFn, Key),
-  {ok, <<"LOCKED">>} = cache_connector:lock_for_update(CmdFn, Key, Owner),
-  %% lock by test_owner
-  {ok, <<"test_owner">>} = cache_connector:lock_for_update(CmdFn, Key, <<"other">>),
-  ok = cache_connector:unlock_for_update(CmdFn, Key, <<"other">>),
-  ok.
+    CmdFn = cmd_fn(),
+    Key = <<"cache-connector-lock">>,
+    Owner = <<"test_owner">>,
+    delete(CmdFn, Key),
+    {ok, <<"LOCKED">>} = cache_connector:lock_for_update(CmdFn, Key, Owner),
+    %% lock by test_owner
+    {ok, <<"test_owner">>} = cache_connector:lock_for_update(CmdFn, Key, <<"other">>),
+    ok = cache_connector:unlock_for_update(CmdFn, Key, <<"other">>),
+    ok.
+
 lua_get(_) ->
-  CmdFn = cmd_fn(),
-  delete(CmdFn, ?KEY),
-  {ok, [undefined, <<"LOCKED">>]} = cache_connector:lua_get(CmdFn, ?KEY, <<"me">>),
-  ok = cache_connector:lua_set(CmdFn, ?KEY, <<"123">>, 1000, <<"me">>),
-  {ok, [<<"123">>, undefined]} = cache_connector:lua_get(CmdFn, ?KEY, <<"123">>),
-  timer:sleep(1200),
-  {ok, [undefined, <<"LOCKED">>]} = cache_connector:lua_get(CmdFn, ?KEY, <<"me">>),
-  ok.
+    CmdFn = cmd_fn(),
+    delete(CmdFn, ?KEY),
+    {ok, [undefined, <<"LOCKED">>]} = cache_connector:lua_get(CmdFn, ?KEY, <<"me">>),
+    ok = cache_connector:lua_set(CmdFn, ?KEY, <<"123">>, 1000, <<"me">>),
+    {ok, [<<"123">>, undefined]} = cache_connector:lua_get(CmdFn, ?KEY, <<"123">>),
+    timer:sleep(1200),
+    {ok, [undefined, <<"LOCKED">>]} = cache_connector:lua_get(CmdFn, ?KEY, <<"me">>),
+    ok.
+
 lua_delete(_) ->
-  CmdFn = cmd_fn(),
-  delete(CmdFn, ?KEY),
-  ok = cache_connector:lua_delete(CmdFn, ?KEY),
-  ok.
+    CmdFn = cmd_fn(),
+    delete(CmdFn, ?KEY),
+    ok = cache_connector:lua_delete(CmdFn, ?KEY),
+    ok.
+
 weak_fetch(_) ->
-   Key = <<"weak_fetch1">>,
-   V1 = <<"v1">>,
-   V2 = <<"v2">>,
-   CmdFn = cmd_fn(),
-   delete(CmdFn, Key),
-   CmdFn1 = cmd_fn1(),
-   Begin = erlang:system_time(1000),
-   erlang:spawn(fun() ->
-        {ok, V1} = cache_connector:fetch(#{type => weak,
-         cmd_fn => CmdFn,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(V1, 200)})
-        end),
+    Key = <<"weak_fetch1">>,
+    V1 = <<"v1">>,
+    V2 = <<"v2">>,
+    CmdFn = cmd_fn(),
+    delete(CmdFn, Key),
+    CmdFn1 = cmd_fn1(),
+    Begin = erlang:system_time(1000),
+    erlang:spawn(fun() ->
+                    {ok, V1} =
+                        cache_connector:fetch(#{type => weak,
+                                                cmd_fn => CmdFn,
+                                                key => Key,
+                                                ttl => 60000,
+                                                fn => gen_data_func(V1, 200)})
+                 end),
     timer:sleep(20),
-      {ok, V1} = cache_connector:fetch(#{type => weak,
-         cmd_fn => CmdFn1,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(V1, 201)}),
-     ?assertEqual(time_since(Begin) > 150, true),
-     ok = cache_connector:tag_deleted(CmdFn, Key),
-   {ok, V1} = cache_connector:fetch(#{type => weak,
-         cmd_fn => CmdFn1,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(V2, 200)}),
-     timer:sleep(300),
-     {ok, V2} = cache_connector:fetch(#{type => weak,
-         cmd_fn => CmdFn1,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(<<"ignore">>, 200)}),
-  ok.
+    {ok, V1} =
+        cache_connector:fetch(#{type => weak,
+                                cmd_fn => CmdFn1,
+                                key => Key,
+                                ttl => 60000,
+                                fn => gen_data_func(V1, 201)}),
+    ?assertEqual(time_since(Begin) > 150, true),
+    ok = cache_connector:tag_deleted(CmdFn, Key),
+    {ok, V1} =
+        cache_connector:fetch(#{type => weak,
+                                cmd_fn => CmdFn1,
+                                key => Key,
+                                ttl => 60000,
+                                fn => gen_data_func(V2, 200)}),
+    timer:sleep(300),
+    {ok, V2} =
+        cache_connector:fetch(#{type => weak,
+                                cmd_fn => CmdFn1,
+                                key => Key,
+                                ttl => 60000,
+                                fn => gen_data_func(<<"ignore">>, 200)}),
+    ok.
 
 weak_fetch_error(_) ->
-   Key = <<"weak_fetch">>,
-   V1 = <<"v1">>,
-   CmdFn = cmd_fn(),
-   delete(CmdFn, Key),
-   Begin = erlang:system_time(1000),
-   {error, not_found} = cache_connector:fetch(#{type => weak,
-         cmd_fn => CmdFn,
-         key => Key,
-         ttl => 60000,
-         fn => fun() -> {error, not_found} end}),
-   {ok, V1} = cache_connector:fetch(#{type => weak,
-         cmd_fn => CmdFn,
-         key => Key,
-         ttl => 60000,
-         fn => fun() -> {ok, V1} end}),
-   ?assertEqual(time_since(Begin) < 150, true),
-  ok.
+    Key = <<"weak_fetch">>,
+    V1 = <<"v1">>,
+    CmdFn = cmd_fn(),
+    delete(CmdFn, Key),
+    Begin = erlang:system_time(1000),
+    {error, not_found} =
+        cache_connector:fetch(#{type => weak,
+                                cmd_fn => CmdFn,
+                                key => Key,
+                                ttl => 60000,
+                                fn => fun() -> {error, not_found} end}),
+    {ok, V1} =
+        cache_connector:fetch(#{type => weak,
+                                cmd_fn => CmdFn,
+                                key => Key,
+                                ttl => 60000,
+                                fn => fun() -> {ok, V1} end}),
+    ?assertEqual(time_since(Begin) < 150, true),
+    ok.
 
 strongfetch(_) ->
-     Key = ?KEY,
-     V1 = <<"v1">>,
-     V2 = <<"v2">>,
-     CmdFn = cmd_fn(),
-     delete(CmdFn, ?KEY),
-     CmdFn1 = cmd_fn1(),
-     Begin = erlang:system_time(1000),
-     erlang:spawn(fun() ->
-        {ok, V1} = cache_connector:fetch(#{type => strong,
-         cmd_fn => CmdFn,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(V1, 200)})
-        end),
+    Key = ?KEY,
+    V1 = <<"v1">>,
+    V2 = <<"v2">>,
+    CmdFn = cmd_fn(),
+    delete(CmdFn, ?KEY),
+    CmdFn1 = cmd_fn1(),
+    Begin = erlang:system_time(1000),
+    erlang:spawn(fun() ->
+                    {ok, V1} =
+                        cache_connector:fetch(#{type => strong,
+                                                cmd_fn => CmdFn,
+                                                key => Key,
+                                                ttl => 60000,
+                                                fn => gen_data_func(V1, 200)})
+                 end),
     timer:sleep(20),
-      {ok, V1} = cache_connector:fetch(#{type => strong,
-         cmd_fn => CmdFn1,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(V1, 200)}),
-     ?assertEqual(true, time_since(Begin) > 150),
-     Begin1 = erlang:system_time(1000),
-     ok = cache_connector:tag_deleted(cmd_fn(), Key),
-     {ok, V2} = cache_connector:fetch(#{type => strong,
-         cmd_fn => CmdFn1,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(V2, 200)}),
+    {ok, V1} =
+        cache_connector:fetch(#{type => strong,
+                                cmd_fn => CmdFn1,
+                                key => Key,
+                                ttl => 60000,
+                                fn => gen_data_func(V1, 200)}),
+    ?assertEqual(true, time_since(Begin) > 150),
+    Begin1 = erlang:system_time(1000),
+    ok = cache_connector:tag_deleted(cmd_fn(), Key),
+    {ok, V2} =
+        cache_connector:fetch(#{type => strong,
+                                cmd_fn => CmdFn1,
+                                key => Key,
+                                ttl => 60000,
+                                fn => gen_data_func(V2, 200)}),
     ?assertEqual(true, time_since(Begin1) > 150),
-    {ok, V2} = cache_connector:fetch(#{type => strong,
-         cmd_fn => CmdFn1,
-         key => Key,
-         ttl => 60000,
-         fn => gen_data_func(<<"ignore">>, 200)}),
+    {ok, V2} =
+        cache_connector:fetch(#{type => strong,
+                                cmd_fn => CmdFn1,
+                                key => Key,
+                                ttl => 60000,
+                                fn => gen_data_func(<<"ignore">>, 200)}),
     ok.
+
 strongfetch_error(_) ->
-     Key = ?KEY,
-     Begin = erlang:system_time(1000),
-     CmdFn = cmd_fn(),
-     delete(CmdFn, ?KEY),
-  {error, not_found} = cache_connector:fetch(#{
-       type => strong,
-       cmd_fn => CmdFn,
-       key => Key,
-       ttl => 60000,
-       fn => fun() -> {error, not_found} end}),
-  {ok, <<"v1">>} = cache_connector:fetch(#{
-       type => strong,
-       cmd_fn => CmdFn,
-       key => Key,
-       ttl => 60000,
-       fn => fun() -> {ok, <<"v1">>} end}),
+    Key = ?KEY,
+    Begin = erlang:system_time(1000),
+    CmdFn = cmd_fn(),
+    delete(CmdFn, ?KEY),
+    {error, not_found} =
+        cache_connector:fetch(#{type => strong,
+                                cmd_fn => CmdFn,
+                                key => Key,
+                                ttl => 60000,
+                                fn => fun() -> {error, not_found} end}),
+    {ok, <<"v1">>} =
+        cache_connector:fetch(#{type => strong,
+                                cmd_fn => CmdFn,
+                                key => Key,
+                                ttl => 60000,
+                                fn => fun() -> {ok, <<"v1">>} end}),
     ?assertEqual(time_since(Begin) < 150, true),
-  ok.
+    ok.
 
 start_redis() ->
     {ok, _} = application:ensure_all_started(eredis),
     ok.
+
 cmd_fn() ->
     {ok, P} = eredis:start_link("127.0.0.1", 6380, 0, "123456"),
-    fun(L) ->
-        eredis:q(P, L)
-    end.
+    fun(L) -> eredis:q(P, L) end.
+
 cmd_fn1() ->
-  {ok, P1} = eredis:start_link("127.0.0.1", 6380, 0, "123456"),
-    fun(L) ->
-        eredis:q(P1, L)
-    end.
+    {ok, P1} = eredis:start_link("127.0.0.1", 6380, 0, "123456"),
+    fun(L) -> eredis:q(P1, L) end.
+
 gen_data_func(Value, Sleep) ->
     fun() ->
-     timer:sleep(Sleep),
-        {ok, Value}
+       timer:sleep(Sleep),
+       {ok, Value}
     end.
 
 time_since(Begin) ->
-  erlang:system_time(1000) - Begin.
+    erlang:system_time(1000) - Begin.
 
 delete(CmdFn, Key) ->
-  CmdFn([del, Key]).
+    CmdFn([del, Key]).
