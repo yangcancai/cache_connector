@@ -19,17 +19,21 @@
 all() ->
     [lua_get_batch,
      weak_fetch_batch,
+     weak_fetch_batch_some_value_empty,
      weak_fetch_batch_overlap,
      strong_fetch_batch,
      strong_fetch_batch_overlap,
      strong_fetch_batch_overlap_expire,
      strong_fetch_batch_error,
-     strong_fetch_batch_some_value_empty].
+     strong_fetch_batch_some_value_empty,
+     fetch_batch_disable_cache ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(cache_connector),
     cool_tools_logger:set_global_loglevel(debug),
     cool_tools_logger:start_default_log(true),
+    persistent_term:put(all_empty, false),
+    cache_connector:set_config(empty_expire, 60000),
     start_redis(),
     new_meck(),
     Config.
@@ -72,7 +76,16 @@ lua_get_batch(_) ->
       [undefined, <<"LOCKED">>]]} =
         cache_connector:lua_get_batch(CmdFn, Keys, Owner),
     ok.
-
+fetch_batch_disable_cache(_) ->
+   N = 10 + rand:uniform(20),
+   {Keys, Values1, Values2, Values3} = get_batch_data(N),
+  {ok, Values1} = cache_connector:fetch_batch(#{keys => Keys,
+   fn => gen_batch_data_func(Values1, 200)}),
+  {ok, Values2} = cache_connector:fetch_batch(#{keys => Keys,
+   fn => gen_batch_data_func(Values2, 200)}),
+  {ok, Values3} = cache_connector:fetch_batch(#{keys => Keys,
+   fn => gen_batch_data_func(Values3, 200)}),
+  ok.
 weak_fetch_batch(_) ->
     CmdFn = cmd_fn(),
     N = 10 + rand:uniform(20),
@@ -111,6 +124,35 @@ weak_fetch_batch(_) ->
                                       keys => Keys,
                                       ttl => 60000,
                                       fn => gen_batch_data_func(N, Values3, 200)}),
+    ok.
+weak_fetch_batch_some_value_empty(_) ->
+    CmdFn = cmd_fn(),
+    N = 10 + rand:uniform(20),
+    Begin = erlang:system_time(1000),
+    Keys = gen_keys(N),
+    ok = cache_connector:set_config(empty_expire, 0),
+    persistent_term:put(all_empty, true),
+    Values1 = get_value(<<"v1_">>, Keys),
+    persistent_term:put(all_empty, false),
+    Values2 = get_value(<<"v2_">>, Keys),
+    delete_batch(CmdFn, Keys),
+    erlang:spawn(fun() ->
+                    {ok, Values1} =
+                        cache_connector:fetch_batch(#{type => weak,
+                                                      cmd_fn => CmdFn,
+                                                      keys => Keys,
+                                                      ttl => 60000,
+                                                      fn => gen_batch_data_func(N, Values1, 200)})
+                 end),
+    timer:sleep(20),
+    {ok, Values2} =
+        cache_connector:fetch_batch(#{type => weak,
+                                      cmd_fn => CmdFn,
+                                      keys => Keys,
+                                      ttl => 60000,
+                                      fn => gen_batch_data_func(N, Values2, 200)}),
+    ?assertEqual(time_since(Begin) > 150, true),
+    ok = cache_connector:tag_deleted_batch(CmdFn, Keys),
     ok.
 
 weak_fetch_batch_overlap(_) ->
@@ -209,7 +251,13 @@ strong_fetch_batch_some_value_empty(_) ->
     CmdFn1 = cmd_fn1(),
     N = 10 + rand:uniform(20),
     Begin = erlang:system_time(1000),
-    {Keys, Values1, Values2, Values3} = get_batch_data(N),
+    ok = cache_connector:set_config(empty_expire, 0),
+    Keys = gen_keys(N),
+    persistent_term:put(all_empty, true),
+    Values1 = get_value(<<"v1_">>,Keys),
+    persistent_term:put(all_empty, false),
+    Values2 = get_value(<<"v2_">>,Keys),
+    Values3 = get_value(<<"v3_">>,Keys),
     Values4 = get_value(<<"v4_">>, Keys),
     delete_batch(CmdFn, Keys),
     erlang:spawn(fun() ->
@@ -218,15 +266,16 @@ strong_fetch_batch_some_value_empty(_) ->
                                                       cmd_fn => CmdFn1,
                                                       keys => Keys,
                                                       ttl => 60000,
-                                                      fn => gen_batch_data_func(N, Values1, 200)})
+                                                      fn => gen_batch_data_func(N, Values1, 0)})
                  end),
     timer:sleep(20),
-    {ok, Values1} =
+    {ok, Values11} =
         cache_connector:fetch_batch(#{type => strong,
                                       cmd_fn => CmdFn,
                                       keys => Keys,
                                       ttl => 60000,
                                       fn => gen_batch_data_func(N, Values2, 200)}),
+    ?assertEqual(Values2, Values11),
     ?assertEqual(time_since(Begin) > 150, true),
     ok = cache_connector:tag_deleted_batch(CmdFn, Keys),
     Begin1 = erlang:system_time(1000),
@@ -237,7 +286,7 @@ strong_fetch_batch_some_value_empty(_) ->
                                       ttl => 60000,
                                       fn => gen_batch_data_func(N, Values3, 200)}),
     ?assertEqual(time_since(Begin1) > 150, true),
-    {ok, Values3} =
+    {ok, _} =
         cache_connector:fetch_batch(#{type => strong,
                                       cmd_fn => CmdFn,
                                       keys => Keys,
@@ -250,6 +299,7 @@ strong_fetch_batch(_) ->
     CmdFn1 = cmd_fn1(),
     N = 10 + rand:uniform(20),
     Begin = erlang:system_time(1000),
+    cache_connector:set_config(empty_expire, 60000),
     {Keys, Values1, Values2, Values3} = get_batch_data(N),
     Values4 = get_value(<<"v4_">>, Keys),
     delete_batch(CmdFn, Keys),
@@ -442,7 +492,7 @@ get_batch_data(Prefix, Keys, Start, End) when is_binary(Prefix) ->
      [<<Prefix/binary, (erlang:integer_to_binary(I))/binary>> || I <- lists:seq(Start, End)]}.
 
 get_value(Prefix, Keys) ->
-    [<<Prefix/binary, (erlang:integer_to_binary(I))/binary>>
+    [rand_empty(<<Prefix/binary, (erlang:integer_to_binary(I))/binary>>)
      || I <- lists:seq(1, erlang:length(Keys))].
 
 get_batch_data(N) ->
@@ -464,12 +514,16 @@ get_keys(I, {Keys, Values1, Values2, Values3}) ->
      [rand_empty(<<"v3-", I1/binary>>) | Values3]}.
 
 rand_empty(V) ->
+    case persistent_term:get(all_empty) of
+      true ->
+         <<>>;
+      _->
     case rand:uniform(10) < 5 of
         true ->
             <<>>;
         _ ->
             V
-    end.
+    end end.
 
 gen_batch_data_func(Values, Sleep) ->
     fun(Idxs) ->

@@ -64,13 +64,8 @@
 
 init_default_config() ->
   [begin
-     case catch get_config(K) of
-       {'EXIT', _}  ->
          ok = set_config(K, V),
-         {K, V};
-       V1 ->
-         {K, V1}
-     end
+         {K, V}
    end|| {K, V} <- default_config()].
 default_config() ->
   [{locked_sleep, 100},
@@ -110,7 +105,7 @@ fetch_batch(#{type := strong, cmd_fn := CmdFn, keys := Keys, ttl := TTL, fn := F
 fetch_batch(#{type := weak, cmd_fn := CmdFn, keys := Keys, ttl := TTL, fn := Fn}) ->
   weak_fetch_batch(CmdFn, Keys, TTL, Fn);
 fetch_batch(#{keys := Keys, fn := Fn}) ->
-  Fn(Keys).
+  Fn([ I || I <- lists:seq(1, erlang:length(Keys))]).
 tag_deleted(CmdFn, Key) ->
   case ?WAIT_REPLICAS > 0 of
       true ->
@@ -143,9 +138,12 @@ raw_get(CmdFn, Key) ->
 
 raw_set(CmdFn, Key, Value, TTL) ->
   case CmdFn([hset, Key, value, Value]) of
-       ok ->
-         CmdFn([expire, Key, to_seconds(TTL)]);
-       E -> E
+    {ok, _} ->
+         case CmdFn([expire, Key, to_seconds(TTL)]) of
+           {ok, _}  -> ok;
+           E -> E
+         end;
+    E -> E
   end.
 -spec lua_get(CmdFn :: fun((Elem :: L) -> Return),
     Key :: binary(),

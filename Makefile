@@ -27,6 +27,7 @@ distclean:
 .PHONY: test eunit ct testclean
 
 test: epmd dialyzer ct eunit
+	./rebar3 cover --verbose
 
 eunit: epmd
 	./rebar3 do eunit -d test/eunit -v

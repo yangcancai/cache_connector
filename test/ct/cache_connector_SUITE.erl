@@ -33,14 +33,17 @@
 -define(KEY, <<"cache-connector-test-key">>).
 
 all() ->
-    [config,
+    [
+     raw,
+     config,
      lock,
      lua_get,
      lua_delete,
      weak_fetch,
      weak_fetch_error,
      strongfetch,
-     strongfetch_error].
+     strongfetch_error,
+     fetch_disable_cache ].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(cache_connector),
@@ -72,7 +75,21 @@ del_meck() ->
 
 handle(_Config) ->
     ok.
-
+raw(_) ->
+    Key = <<"raw">>,
+    V1 = <<"v1">>,
+    V2 = <<"v2">>,
+    CmdFn = cmd_fn(),
+    delete(CmdFn, Key),
+  {ok, V1} =  cache_connector:fetch(#{type => weak,
+                                                cmd_fn => CmdFn,
+                                                key => Key,
+                                                ttl => 60000,
+                                                fn => gen_data_func(V1, 200)}),
+  {ok, V1} = cache_connector:raw_get(CmdFn, Key),
+  ok  = cache_connector:raw_set(CmdFn, Key, V2, 60000),
+  {ok, V2} = cache_connector:raw_get(CmdFn, Key),
+  ok.
 config(_) ->
     ?assertEqual(cache_connector:default_config(), cache_connector:get_config()),
     {error, _} = cache_connector:set_config(error_key, 1),
@@ -80,7 +97,10 @@ config(_) ->
     ok = cache_connector:set_config(locked_sleep, 1),
     1 = cache_connector:get_config(locked_sleep),
     ok.
-
+fetch_disable_cache(_) ->
+  {ok, <<"v">>} = cache_connector:fetch(#{fn => gen_data_func(<<"v">>, 200)}),
+  {ok, <<"v1">>} = cache_connector:fetch(#{fn => gen_data_func(<<"v1">>, 200)}),
+  ok.
 lock(_) ->
     CmdFn = cmd_fn(),
     Key = <<"cache-connector-lock">>,
